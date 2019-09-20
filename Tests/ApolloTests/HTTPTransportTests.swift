@@ -22,6 +22,7 @@ class HTTPTransportTests: XCTestCase {
   
   private var shouldModifyURLInWillSend = false
   private var retryCount = 0
+  private var graphQlErrors = [GraphQLError]()
 
   private lazy var url = URL(string: "http://localhost:8080/graphql")!
   private lazy var networkTransport = HTTPNetworkTransport(url: self.url,
@@ -182,7 +183,7 @@ class HTTPTransportTests: XCTestCase {
     
     self.wait(for: [expectation], timeout: 10)
   }
-  
+
   func testEquality() {
     let identicalTransport = HTTPNetworkTransport(url: self.url,
                                                   useGETForQueries: true,
@@ -192,6 +193,27 @@ class HTTPTransportTests: XCTestCase {
     let nonIdenticalTransport = HTTPNetworkTransport(url: self.url,
                                                      delegate: self)
     XCTAssertNotEqual(self.networkTransport, nonIdenticalTransport)
+  }
+
+  func testGraphQLErrorRertry() {
+    let expectation = self.expectation(description: "Send operation completed")
+
+    let cancellable = self.networkTransport.send(operation: HeroNameQuery()) { result in
+      self.validateHeroNameQueryResponse(result: result, expectation: expectation)
+    }
+
+    guard
+      let task = cancellable as? URLSessionTask,
+      let url = task.currentRequest?.url else {
+        XCTFail("Couldn't get url!")
+        cancellable.cancel()
+        expectation.fulfill()
+        return
+    }
+
+    XCTAssertEqual(url, self.url)
+
+    self.wait(for: [expectation], timeout: 10)
   }
 }
 
@@ -261,5 +283,13 @@ extension HTTPTransportTests: HTTPNetworkTransportRetryDelegate {
     case .invalidResponse:
       retryHandler(false)
     }
+  }
+}
+
+// MARK: - NetworkGraphQLErrorDelegate
+extension HTTPTransportTests: NetworkGraphQLErrorDelegate {
+  func networkTransport(_ networkTransport: HTTPNetworkTransport, receivedGraphQLErrors errors: [GraphQLError], retryHandler: @escaping (Bool) -> Void) {
+    self.graphQlErrors = errors
+    retryHandler(false)
   }
 }

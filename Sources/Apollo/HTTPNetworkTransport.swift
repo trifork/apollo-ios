@@ -67,6 +67,23 @@ public protocol HTTPNetworkTransportRetryDelegate: HTTPNetworkTransportDelegate 
 
 // MARK: -
 
+/// Methods which will be called after some kind of response has been received and it contains GraphQLErrors
+public protocol HTTPNetworkTransportGraphQLErrorDelegate: HTTPNetworkTransportDelegate {
+
+
+  /// Called when response contains one or more GraphQL errors.
+  /// NOTE: Don't just call the `retryHandler` with `true` all the time, or you can potentially wind up in an infinite loop of errors
+  ///
+  /// - Parameters:
+  ///   - networkTransport: The network transport which received the error
+  ///   - errors: The received GraphQL errors
+  ///   - retryHandler: A closure indicating whether the operation should be retried. Asyncrhonous to allow for re-authentication or other async operations to complete.
+  func networkTransport(_ networkTransport: HTTPNetworkTransport, receivedGraphQLErrors errors: [GraphQLError], retryHandler: @escaping (_ shouldRetry: Bool) -> Void)
+}
+
+
+// MARK: -
+
 /// A network transport that uses HTTP POST requests to send GraphQL operations to a server, and that uses `URLSession` as the networking implementation.
 public class HTTPNetworkTransport {
   let url: URL
@@ -74,6 +91,7 @@ public class HTTPNetworkTransport {
   let serializationFormat = JSONSerializationFormat.self
   let useGETForQueries: Bool
   let delegate: HTTPNetworkTransportDelegate?
+  let requestCreator: RequestCreator
   private let sendOperationIdentifiers: Bool
   
   /// Creates a network transport with the specified server URL and session configuration.
@@ -84,16 +102,19 @@ public class HTTPNetworkTransport {
   ///   - sendOperationIdentifiers: Whether to send operation identifiers rather than full operation text, for use with servers that support query persistence. Defaults to false.
   ///   - useGETForQueries: If query operation should be sent using GET instead of POST. Defaults to false.
   ///   - delegate: [Optional] A delegate which can conform to any or all of `HTTPNetworkTransportPreflightDelegate`, `HTTPNetworkTransportTaskCompletedDelegate`, and `HTTPNetworkTransportRetryDelegate`. Defaults to nil.
+  ///   - requestCreator: Return a custom implementation of RequestCreator. If not provided it will use default Apollo implementation.
   public init(url: URL,
               session: URLSession = .shared,
               sendOperationIdentifiers: Bool = false,
               useGETForQueries: Bool = false,
-              delegate: HTTPNetworkTransportDelegate? = nil) {
+              delegate: HTTPNetworkTransportDelegate? = nil,
+              requestCreator: RequestCreator = ApolloRequestCreator()) {
     self.url = url
     self.session = session
     self.sendOperationIdentifiers = sendOperationIdentifiers
     self.useGETForQueries = useGETForQueries
     self.delegate = delegate
+    self.requestCreator = requestCreator
   }
 
   private func send<Operation>(operation: Operation, files: [GraphQLFile]?, completionHandler: @escaping (_ results: Result<GraphQLResponse<Operation>, Error>) -> Void) -> Cancellable {
@@ -153,7 +174,11 @@ public class HTTPNetworkTransport {
           throw GraphQLHTTPResponseError(body: data, response: httpResponse, kind: .invalidResponse)
         }
         let response = GraphQLResponse(operation: operation, body: body)
-        completionHandler(.success(response))
+
+        try self?.handleGraphQLErrorsOrComplete(operation: operation,
+                                                files: files,
+                                                response: response,
+                                                completionHandler: completionHandler)
       } catch let parsingError {
         self?.handleErrorOrRetry(operation: operation,
                                  error: parsingError,
@@ -167,7 +192,28 @@ public class HTTPNetworkTransport {
     
     return task
   }
-  
+
+  private func handleGraphQLErrorsOrComplete<Operation>(operation: Operation,
+                                                        files: [GraphQLFile]?,
+                                                        response: GraphQLResponse<Operation>,
+                                                        completionHandler: @escaping (_ result: Result<GraphQLResponse<Operation>, Error>) -> Void) throws {
+    guard let delegate = self.delegate as? HTTPNetworkTransportGraphQLErrorDelegate,
+      let graphQLErrors = response.parseErrorsOnlyFast(),
+      !graphQLErrors.isEmpty else {
+        completionHandler(.success(response))
+        return
+    }
+
+    delegate.networkTransport(self, receivedGraphQLErrors: graphQLErrors, retryHandler: { [weak self] shouldRetry in
+      guard shouldRetry else {
+        completionHandler(.success(response))
+        return
+      }
+
+      _ = self?.send(operation: operation, files: files, completionHandler: completionHandler)
+    })
+  }
+
   private func handleErrorOrRetry<Operation>(operation: Operation,
                                              error: Error,
                                              for request: URLRequest,
@@ -213,7 +259,7 @@ public class HTTPNetworkTransport {
   }
   
   private func createRequest<Operation: GraphQLOperation>(for operation: Operation, files: [GraphQLFile]?) throws -> URLRequest {
-    let body = RequestCreator.requestBody(for: operation, sendOperationIdentifiers: self.sendOperationIdentifiers)
+    let body = requestCreator.requestBody(for: operation, sendOperationIdentifiers: self.sendOperationIdentifiers)
     var request = URLRequest(url: self.url)
     
     // We default to json, but this can be changed below if needed.
@@ -230,7 +276,7 @@ public class HTTPNetworkTransport {
     } else {
       do {
         if let files = files, !files.isEmpty {
-          let formData = try RequestCreator.requestMultipartFormData(
+          let formData = try requestCreator.requestMultipartFormData(
             for: operation,
             files: files,
             sendOperationIdentifiers: self.sendOperationIdentifiers,
