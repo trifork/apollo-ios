@@ -91,7 +91,7 @@ public class HTTPNetworkTransport {
   let serializationFormat = JSONSerializationFormat.self
   let useGETForQueries: Bool
   let delegate: HTTPNetworkTransportDelegate?
-  let requestCreator: RequestCreator
+  private let requestCreator: RequestCreator
   private let sendOperationIdentifiers: Bool
   
   /// Creates a network transport with the specified server URL and session configuration.
